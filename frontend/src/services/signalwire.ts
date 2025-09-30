@@ -53,8 +53,6 @@ class SignalWireService {
         token: this.currentToken.token,
         host: this.currentToken.space_name,
         logLevel: 'debug',  // Enable debug logging
-        connectionPoolSize: 1,
-        iceCandidatePoolSize: 10,
         debug: {
           logWsTraffic: true,  // Log all WebSocket traffic
         },
@@ -475,8 +473,8 @@ class SignalWireService {
       const dialParams = {
         to: formattedNumber,  // Try direct first, may need /public/ prefix
         rootElement: rootElement,
-	callerIdName: "Brian West",
-	callerIdNumber: "+12068655443",
+	      callerIdName: "Brian West",
+	      callerIdNumber: "+12068655443",
         audio: true,
         video: false,
       };
@@ -565,6 +563,7 @@ class SignalWireService {
           console.log('📵 Call hung up:', reason);
           this.handleCallEnded();
         });
+        await call.start();
       } else {
         console.error('⚠️ Call object is null/undefined!');
       }
@@ -696,7 +695,6 @@ class SignalWireService {
           this.handleCallEnded();
         });
 
-        // Listen for errors
         acceptedCall.on('error', (error: any) => {
           console.error('❌ Call error:', error);
         });
