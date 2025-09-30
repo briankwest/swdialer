@@ -1,4 +1,4 @@
-import React from 'react';
+import React, { useRef, useState } from 'react';
 import { Phone, Delete } from 'lucide-react';
 import { DialPadKey } from '../types';
 
@@ -6,6 +6,7 @@ interface DialPadProps {
   onKeyPress: (key: string) => void;
   onCall: () => void;
   onDelete: () => void;
+  onClearAll?: () => void; // Optional callback for clearing all
   hasNumber: boolean;
   disabled?: boolean;
   hideText?: string; // Optional text to show instead of delete icon
@@ -39,17 +40,60 @@ const DialPad: React.FC<DialPadProps> = ({
   onKeyPress,
   onCall,
   onDelete,
+  onClearAll,
   hasNumber,
   disabled = false,
   hideText,
   callButtonText
 }) => {
+  const [isLongPressing, setIsLongPressing] = useState(false);
+  const longPressTimer = useRef<NodeJS.Timeout | null>(null);
+  const deleteButtonRef = useRef<HTMLButtonElement>(null);
   const handleKeyPress = (key: string) => {
     if (!disabled) {
       onKeyPress(key);
       // Play DTMF tone here if needed
       playDTMFTone(key);
     }
+  };
+
+  const handleDeleteMouseDown = () => {
+    // Start timer for long press (2 seconds)
+    longPressTimer.current = setTimeout(() => {
+      setIsLongPressing(true);
+      // Trigger clear all if callback provided
+      if (onClearAll) {
+        onClearAll();
+      } else {
+        // If no clear all callback, repeatedly delete
+        onDelete();
+      }
+      // Visual/haptic feedback could go here
+    }, 2000);
+  };
+
+  const handleDeleteMouseUp = () => {
+    // Clear the timer
+    if (longPressTimer.current) {
+      clearTimeout(longPressTimer.current);
+      longPressTimer.current = null;
+    }
+
+    // If it wasn't a long press, do a normal delete
+    if (!isLongPressing) {
+      onDelete();
+    }
+
+    setIsLongPressing(false);
+  };
+
+  const handleDeleteMouseLeave = () => {
+    // Cancel long press if mouse/finger leaves button
+    if (longPressTimer.current) {
+      clearTimeout(longPressTimer.current);
+      longPressTimer.current = null;
+    }
+    setIsLongPressing(false);
   };
 
   const playDTMFTone = (key: string) => {
@@ -148,13 +192,19 @@ const DialPad: React.FC<DialPadProps> = ({
 
         {hasNumber ? (
           <button
-            onClick={onDelete}
-            className="dial-button hover:bg-ios-gray-600"
+            ref={deleteButtonRef}
+            onMouseDown={handleDeleteMouseDown}
+            onMouseUp={handleDeleteMouseUp}
+            onMouseLeave={handleDeleteMouseLeave}
+            onTouchStart={handleDeleteMouseDown}
+            onTouchEnd={handleDeleteMouseUp}
+            onTouchCancel={handleDeleteMouseLeave}
+            className={`dial-button hover:bg-ios-gray-600 ${isLongPressing ? 'bg-red-600' : ''}`}
           >
             {hideText ? (
               <span className="text-sm text-gray-300">{hideText}</span>
             ) : (
-              <Delete size={24} className="text-gray-300" />
+              <Delete size={24} className={isLongPressing ? 'text-white animate-pulse' : 'text-gray-300'} />
             )}
           </button>
         ) : (

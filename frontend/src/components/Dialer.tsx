@@ -42,6 +42,10 @@ const Dialer: React.FC = () => {
     setPhoneNumber((prev) => prev.slice(0, -1));
   };
 
+  const handleClearAll = () => {
+    setPhoneNumber('');
+  };
+
   const handleCall = async () => {
     console.log('📢 handleCall() triggered');
     console.log('Current phoneNumber:', phoneNumber);
@@ -238,6 +242,7 @@ const Dialer: React.FC = () => {
             onKeyPress={handleKeyInput}
             onCall={handleCall}
             onDelete={handleDelete}
+            onClearAll={handleClearAll}
             hasNumber={phoneNumber.length > 0}
             disabled={isInCall || isCallingInProgress}
           />

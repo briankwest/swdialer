@@ -93,6 +93,7 @@ const CallScreen: React.FC<CallScreenProps> = ({
                 onKeyPress={handleDialPadKey}
                 onCall={() => setShowDialPad(false)} // Hide button
                 onDelete={() => setDialPadInput(prev => prev.slice(0, -1))} // Delete functionality
+                onClearAll={() => setDialPadInput('')} // Clear all functionality
                 hasNumber={true}
                 disabled={false}
                 callButtonText="Hide"

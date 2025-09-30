@@ -7,7 +7,7 @@ A web-based iPhone-style dialer application built with React and SignalWire SDK 
 - ✅ iPhone-style dialer UI with dark theme
 - ✅ Outbound calling with DTMF tones
 - ✅ Inbound call reception with full-screen UI
-- ✅ Automatic token refresh (50-minute intervals)
+- ✅ Automatic token refresh (at 80% of token lifetime)
 - ✅ Call controls (mute, speaker, keypad)
 - ✅ Real-time call duration display
 - ✅ In-call DTMF keypad support
@@ -167,7 +167,7 @@ backend/
 
 ### Token Refresh Issues
 
-The application automatically refreshes tokens every 50 minutes (tokens expire after 60 minutes). If you experience disconnections:
+The application automatically refreshes tokens at 80% of their lifetime (e.g., after 48 minutes for a 60-minute token). If you experience disconnections:
 
 1. Check backend logs for token generation errors
 2. Verify SignalWire API credentials

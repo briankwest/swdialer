@@ -54,6 +54,8 @@ class SignalWireService {
         host: this.currentToken.space_name,
         // pubChannelHost: 'puc.swire.io',  // Custom PubChannel host - not available in current SDK type definitions
         logLevel: 'debug',  // Enable debug logging
+	connectionPoolSize: 1,
+	iceCandidatePoolSize: 10,
         debug: {
           logWsTraffic: true,  // Log all WebSocket traffic
         },
