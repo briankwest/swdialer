@@ -1,4 +1,4 @@
-import { SignalWire } from '@signalwire/js';
+import { SignalWire } from '@signalwire/client';
 import type { TokenData } from '../types';
 import { authAPI } from './api';
 import { toneService } from './tones';
@@ -52,10 +52,9 @@ class SignalWireService {
       this.client = await SignalWire({
         token: this.currentToken.token,
         host: this.currentToken.space_name,
-        // pubChannelHost: 'puc.swire.io',  // Custom PubChannel host - not available in current SDK type definitions
         logLevel: 'debug',  // Enable debug logging
-	connectionPoolSize: 1,
-	iceCandidatePoolSize: 10,
+        connectionPoolSize: 1,
+        iceCandidatePoolSize: 10,
         debug: {
           logWsTraffic: true,  // Log all WebSocket traffic
         },
@@ -632,9 +631,8 @@ class SignalWireService {
       }
 
       // Accept the invite - this returns the actual call object
-      // The SDK internally calls answer() after accept()
       console.log('🎯 Calling invite.accept()...');
-      const acceptedCall = await invite.accept({
+      const acceptedCall = invite.accept({
         rootElement: rootElement,
         audio: true,
         video: false,
@@ -647,8 +645,17 @@ class SignalWireService {
       // Now store the actual call object
       this.currentCall = acceptedCall;
 
-      // DO NOT call answer() again - the SDK already did it internally
-      // Calling answer() again causes negotiation loops
+      // Store in window for debugging (like in the example)
+      // @ts-ignore
+      window._calleeCall = acceptedCall;
+
+      // Start the call - THIS IS CRITICAL!
+      console.log('🚀 Starting the accepted call...');
+      await acceptedCall.start();
+      console.log('✅ Call started successfully');
+
+      // @ts-ignore
+      window._calleeCallAnswered = true;
 
       // Set up event listeners for the accepted call (matching official example)
       if (acceptedCall) {
@@ -684,6 +691,8 @@ class SignalWireService {
         // Keep our additional events for redundancy
         acceptedCall.on('destroy', () => {
           console.log('💥 Call destroyed');
+          // @ts-ignore
+          window._calleeCallDestroyed = true;
           this.handleCallEnded();
         });
 

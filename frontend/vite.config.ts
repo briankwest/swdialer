@@ -1,5 +1,6 @@
 import { defineConfig, loadEnv } from 'vite'
 import react from '@vitejs/plugin-react'
+import path from 'path'
 
 // https://vitejs.dev/config/
 export default defineConfig(({ mode }) => {
@@ -20,6 +21,15 @@ export default defineConfig(({ mode }) => {
 
   return {
     plugins: [react()],
+    resolve: {
+      alias: {
+        // Help resolve tslib for the linked @signalwire/client package
+        'tslib': path.resolve(__dirname, 'node_modules/tslib/tslib.es6.js')
+      }
+    },
+    optimizeDeps: {
+      include: ['@signalwire/client', 'tslib'] // Pre-bundle both packages
+    },
     server: {
       port: 5173,
       host: true, // Listen on all addresses
