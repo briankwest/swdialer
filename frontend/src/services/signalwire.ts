@@ -7,6 +7,7 @@ class SignalWireService {
   private client: any = null;
   private currentCall: any = null;
   private currentInvite: any = null;  // Store invite separately from active call
+  private currentCallId: string | null = null;  // Track the ID of the current active call
   private currentToken: TokenData | null = null;
   private tokenRefreshTimer: NodeJS.Timeout | null = null;
   private onIncomingCall: ((remoteNumber: string) => void) | null = null;
@@ -112,6 +113,26 @@ class SignalWireService {
 
             // According to SDK, notification has an 'invite' object with details, accept(), and reject()
             if (notification.invite) {
+              // CHECK: Are we already in a call? If so, auto-reject
+              if (this.currentCall) {
+                console.log('📵 Already in a call - auto-rejecting incoming call');
+
+                // Extract caller info for logging purposes
+                const details = notification.invite.details || {};
+                const callerId = details.caller_id_number ||
+                                details.caller_id_name ||
+                                details.from ||
+                                'Unknown';
+                console.log('🚫 Rejected incoming call from:', callerId);
+
+                // Reject the incoming call immediately
+                notification.invite.reject();
+
+                // Return without processing further
+                return;
+              }
+
+              // Normal incoming call flow - no active call exists
               // Store the invite separately - NOT as currentCall
               this.currentInvite = notification.invite;
 
@@ -210,6 +231,16 @@ class SignalWireService {
             if (eventName === 'verto.bye') {
               console.log('🔴 Remote party hung up (verto.bye)');
 
+              // Extract the call ID from the verto.bye event
+              const byeCallId = data?.callID || data?.dialogParams?.callID;
+              console.log('verto.bye callID:', byeCallId, 'our callID:', this.currentCallId);
+
+              // IMPORTANT: Only handle if this is for OUR current call
+              if (this.currentCallId && byeCallId && byeCallId !== this.currentCallId) {
+                console.log('📞 Ignoring verto.bye - event is for different call');
+                return;
+              }
+
               // Only play disconnect tone if we're in an active call (not ringing)
               // Check if there's an actual call in progress
               if (this.currentCall && this.currentCall.state === 'active') {
@@ -232,6 +263,14 @@ class SignalWireService {
               // This prevents handling stray events from other calls
               if (!this.currentCall && !this.currentInvite) {
                 console.log('📞 Ignoring call.state - no active call or invite');
+                return;
+              }
+
+              // IMPORTANT: Check if this event is for OUR current call
+              // If we have a currentCallId and the event's callId doesn't match, ignore it
+              // This prevents rejected incoming calls from resetting our active call UI
+              if (this.currentCallId && callId && callId !== this.currentCallId) {
+                console.log(`📞 Ignoring call.state - event is for different call (event: ${callId}, ours: ${this.currentCallId})`);
                 return;
               }
 
@@ -377,6 +416,7 @@ class SignalWireService {
 
       // Clear any existing call and invite
       this.currentCall = null;
+      this.currentCallId = null;
       this.currentInvite = null;
 
       // Disconnect existing client safely
@@ -505,9 +545,11 @@ class SignalWireService {
         throw dialError;
       }
 
-      // Store the call object
+      // Store the call object and its ID
       this.currentCall = call;
+      this.currentCallId = call?.id || call?.uuid || null;
       this.wasIncomingCall = false;  // Mark this as an outgoing call
+      console.log('📝 Stored outgoing call with ID:', this.currentCallId);
 
       // Set up event listeners
       if (call) {
@@ -546,6 +588,15 @@ class SignalWireService {
 
         call.on('call.state', (state: any) => {
           console.log('📱 Call state change:', state);
+
+          // Extract call ID from event if available
+          const eventCallId = state?.call_id || state?.callID;
+
+          // IMPORTANT: Only process if this event is for OUR call
+          if (this.currentCallId && eventCallId && eventCallId !== this.currentCallId) {
+            console.log(`📞 Ignoring call.state on outbound call object - event is for different call (event: ${eventCallId}, ours: ${this.currentCallId})`);
+            return;
+          }
         });
 
         call.on('call.ended', () => {
@@ -588,6 +639,7 @@ class SignalWireService {
       console.error('Failed to end call:', error);
       // Clear the call reference even if hangup fails
       this.currentCall = null;
+      this.currentCallId = null;
     }
   }
 
@@ -641,8 +693,10 @@ class SignalWireService {
       console.log('Call type:', acceptedCall?.constructor?.name);
       console.log('Call id:', acceptedCall?.id || acceptedCall?.uuid);
 
-      // Now store the actual call object
+      // Now store the actual call object and its ID
       this.currentCall = acceptedCall;
+      this.currentCallId = acceptedCall?.id || acceptedCall?.uuid || null;
+      console.log('📝 Stored incoming call with ID:', this.currentCallId);
 
       // Store in window for debugging (like in the example)
       // @ts-ignore
@@ -661,6 +715,15 @@ class SignalWireService {
         // Listen for call state changes (primary event per official example)
         acceptedCall.on('call.state', (params: any) => {
           console.log('📱 Call state changed:', params.call_state || params);
+
+          // Extract call ID from event
+          const eventCallId = params.call_id || params.callID;
+
+          // IMPORTANT: Only process if this event is for OUR call
+          if (this.currentCallId && eventCallId && eventCallId !== this.currentCallId) {
+            console.log(`📞 Ignoring call.state on call object - event is for different call (event: ${eventCallId}, ours: ${this.currentCallId})`);
+            return;
+          }
 
           // Handle call ended state
           if (params.call_state === 'ended') {
@@ -819,6 +882,7 @@ class SignalWireService {
 
     // Clear the current call and reset tracking
     this.currentCall = null;
+    this.currentCallId = null;  // Clear the tracked call ID
     this.currentInvite = null;
     this.wasIncomingCall = false;
 
@@ -862,6 +926,7 @@ class SignalWireService {
         console.debug('Hangup error during disconnect (ignored):', error.message);
       });
       this.currentCall = null;
+      this.currentCallId = null;
     }
 
     // Clear any pending invite
