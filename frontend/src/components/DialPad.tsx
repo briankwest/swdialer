@@ -47,7 +47,7 @@ const DialPad: React.FC<DialPadProps> = ({
   callButtonText
 }) => {
   const [isLongPressing, setIsLongPressing] = useState(false);
-  const longPressTimer = useRef<NodeJS.Timeout | null>(null);
+  const longPressTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const deleteButtonRef = useRef<HTMLButtonElement>(null);
   const handleKeyPress = (key: string) => {
     if (!disabled) {

@@ -10,12 +10,12 @@
     "preview": "vite preview"
   },
   "dependencies": {
-    "@signalwire/client": "^1.0.0-dev.202509301919.a518d3b.0",
+    "@signalwire/js": "^4.0.0-beta.3",
     "axios": "^1.6.2",
     "lucide-react": "^0.303.0",
     "react": "^18.2.0",
     "react-dom": "^18.2.0",
-    "tslib": "^2.8.1",
+    "rxjs": "^7.8.2",
     "zustand": "^4.4.7"
   },
   "devDependencies": {

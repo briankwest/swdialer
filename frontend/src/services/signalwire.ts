@@ -1,502 +1,210 @@
-import { SignalWire } from '@signalwire/client';
+import { SignalWire } from '@signalwire/js';
+import type { Call } from '@signalwire/js';
+import type { Subscription } from 'rxjs';
 import type { TokenData } from '../types';
 import { authAPI } from './api';
 import { toneService } from './tones';
 
 class SignalWireService {
-  private client: any = null;
-  private currentCall: any = null;
-  private currentInvite: any = null;  // Store invite separately from active call
-  private currentCallId: string | null = null;  // Track the ID of the current active call
+  private client: InstanceType<typeof SignalWire> | null = null;
+  private currentCall: Call | null = null;
+  private pendingCall: Call | null = null;
   private currentToken: TokenData | null = null;
-  private tokenRefreshTimer: NodeJS.Timeout | null = null;
+  private wasIncomingCall: boolean = false;
+  private isInitialized: boolean = false;
+  private isInitializing: boolean = false;
+
+  // RxJS subscriptions
+  private incomingCallSub: Subscription | null = null;
+  private callStatusSub: Subscription | null = null;
+  private remoteStreamSub: Subscription | null = null;
+  private errorSub: Subscription | null = null;
+
+  // Callbacks
   private onIncomingCall: ((remoteNumber: string) => void) | null = null;
-  private onCallEnded: ((wasIncoming: boolean) => void) | null = null;  // Callback for when call ends
-  private isOnline: boolean = false;
-  private hasSetupListeners: boolean = false;
-  private wasIncomingCall: boolean = false;  // Track if current call was incoming
-  private isInitialized: boolean = false;  // Track if we've already initialized
-  private isInitializing: boolean = false;  // Track if initialization is in progress
+  private onCallEnded: ((wasIncoming: boolean) => void) | null = null;
 
   async initialize(
     onIncomingCall?: (remoteNumber: string) => void,
     onCallEnded?: (wasIncoming: boolean) => void
   ) {
-    // Check both flags to prevent double initialization
     if (this.isInitializing || this.isInitialized) {
-      console.log('⚠️ SignalWire initialization already in progress or completed, skipping...');
-      // Wait for initialization to complete if it's in progress
+      console.log('SignalWire initialization already in progress or completed, skipping...');
       while (this.isInitializing) {
         await new Promise(resolve => setTimeout(resolve, 100));
       }
       return true;
     }
 
-    // Set the flag IMMEDIATELY to prevent race conditions
     this.isInitializing = true;
-    console.log('🔐 Starting SignalWire initialization...');
+    console.log('Starting SignalWire initialization...');
 
     try {
       this.onIncomingCall = onIncomingCall || null;
       this.onCallEnded = onCallEnded || null;
 
-      // Get initial token
-      this.currentToken = await authAPI.getToken();
-
-      // Initialize SignalWire Fabric client with debugging enabled
-      console.log('🔐 Initializing SignalWire with token:', {
-        token: this.currentToken.token.substring(0, 20) + '...',
-        host: this.currentToken.space_name,
-        expires_in: this.currentToken.expires_in
-      });
-
-      this.client = await SignalWire({
-        token: this.currentToken.token,
-        host: this.currentToken.space_name,
-        logLevel: 'debug',  // Enable debug logging
-        debug: {
-          logWsTraffic: true,  // Log all WebSocket traffic
+      // Create credential provider with automatic refresh
+      const credentialProvider = {
+        authenticate: async () => {
+          const tokenData = await authAPI.getToken();
+          this.currentToken = tokenData;
+          return {
+            token: tokenData.token,
+            expiry_at: Date.parse(tokenData.expires_at),
+          };
         },
+        refresh: async () => {
+          const tokenData = await authAPI.refreshToken(this.currentToken?.token);
+          this.currentToken = tokenData;
+          return {
+            token: tokenData.token,
+            expiry_at: Date.parse(tokenData.expires_at),
+          };
+        },
+      };
+
+      // Initialize the v4 client
+      this.client = new SignalWire(credentialProvider);
+
+      // Subscribe to errors
+      this.errorSub = this.client.errors$.subscribe((error) => {
+        console.error('SignalWire error:', error);
       });
 
-      console.log('✅ SignalWire client initialized');
-      console.log('Client object:', this.client);
-      console.log('Available client methods:', Object.keys(this.client || {}));
+      // Register for incoming calls
+      await this.client.register();
+      console.log('Client registered and ready for incoming calls');
 
-      // IMMEDIATELY go online to receive incoming calls
-      await this.registerForIncomingCalls();
-      console.log('✅ Client is ONLINE and ready to receive calls');
+      // Subscribe to incoming calls
+      this.incomingCallSub = this.client.session.incomingCalls$.subscribe((calls) => {
+        const ringingCall = calls.find(c => c.status === 'ringing' || c.status === 'new');
+        if (!ringingCall) return;
 
-      // Set up token refresh
-      this.scheduleTokenRefresh();
+        // Auto-reject if already in a call
+        if (this.currentCall) {
+          console.log('Already in a call - auto-rejecting incoming call');
+          ringingCall.reject();
+          return;
+        }
 
-      // Set up event listeners if they exist
-      if (this.client.__wsClient) {
-        this.setupEventListeners();
-      }
+        // Don't re-notify for the same pending call
+        if (this.pendingCall && this.pendingCall.id === ringingCall.id) return;
 
-      // Mark as initialized and clear initializing flag
+        this.pendingCall = ringingCall;
+
+        // fromName/from exist on WebRTCCall at runtime but not on the Call type
+        const callObj = ringingCall as any;
+        const rawName = callObj.fromName;
+        const callerId = (rawName && rawName !== '_undef_') ? rawName : callObj.from || 'Unknown';
+        console.log('Incoming call from:', callerId);
+
+        toneService.playIncomingCallTone();
+        if (this.onIncomingCall) this.onIncomingCall(callerId);
+
+        // Watch for the caller hanging up before we answer
+        const cleanupCanceled = () => {
+          console.log('Incoming call canceled by caller');
+          toneService.stopIncomingCallTone();
+          if (this.pendingCall?.id === ringingCall.id) {
+            this.pendingCall = null;
+            this.handleCallEnded();
+          }
+          pendingSub.unsubscribe();
+        };
+
+        const pendingSub = ringingCall.status$.subscribe({
+          next: (status) => {
+            if (status === 'disconnected' || status === 'failed' || status === 'destroyed') {
+              cleanupCanceled();
+            }
+          },
+          // The SDK completes all subjects on destroy() without emitting a
+          // terminal status, so we must also handle completion.
+          complete: () => {
+            if (this.pendingCall?.id === ringingCall.id) {
+              cleanupCanceled();
+            }
+          },
+        });
+      });
+
       this.isInitialized = true;
       this.isInitializing = false;
-      console.log('✅ SignalWire service fully initialized');
-
+      console.log('SignalWire service fully initialized');
       return true;
     } catch (error) {
       console.error('Failed to initialize SignalWire:', error);
-      // Clear the initializing flag on error
       this.isInitializing = false;
       throw error;
     }
   }
 
-  private async registerForIncomingCalls() {
-    if (!this.client) {
-      console.error('Cannot go online - no client instance');
-      return;
-    }
+  private setupCallSubscriptions(call: Call) {
+    this.cleanupCallSubscriptions();
 
-    // Don't go online again if already online
-    if (this.isOnline) {
-      console.log('✅ Already online, skipping registration');
-      return;
-    }
-
-    try {
-      console.log('🔄 Going online to receive incoming calls...');
-      // Use the online method to register for incoming calls
-      await this.client.online({
-        incomingCallHandlers: {
-          // IMPORTANT: Handler should NOT be async and should return nothing
-          // This matches the official example pattern
-          all: (notification: any) => {
-            console.log('📲 Incoming call notification received:', notification);
-
-            // According to SDK, notification has an 'invite' object with details, accept(), and reject()
-            if (notification.invite) {
-              // CHECK: Are we already in a call? If so, auto-reject
-              if (this.currentCall) {
-                console.log('📵 Already in a call - auto-rejecting incoming call');
-
-                // Extract caller info for logging purposes
-                const details = notification.invite.details || {};
-                const callerId = details.caller_id_number ||
-                                details.caller_id_name ||
-                                details.from ||
-                                'Unknown';
-                console.log('🚫 Rejected incoming call from:', callerId);
-
-                // Reject the incoming call immediately
-                notification.invite.reject();
-
-                // Return without processing further
-                return;
-              }
-
-              // Normal incoming call flow - no active call exists
-              // Store the invite separately - NOT as currentCall
-              this.currentInvite = notification.invite;
-
-              // Extract caller info from the details
-              const details = notification.invite.details || {};
-              const callerId = details.caller_id_number ||
-                              details.caller_id_name ||
-                              details.from ||
-                              'Unknown';
-
-              console.log('📢 Incoming call from:', callerId);
-              console.log('Invite details:', details);
-
-              // Play incoming call alert tone
-              toneService.playIncomingCallTone();
-
-              if (this.onIncomingCall) {
-                this.onIncomingCall(callerId);
-              }
-            } else {
-              console.warn('⚠️ Unexpected notification format:', notification);
-            }
-
-            // Return nothing - handler should not return anything
-            return;
-          }
+    // Subscribe to call status changes
+    this.callStatusSub = call.status$.subscribe((status) => {
+      console.log('Call status:', status);
+      if (status === 'disconnected' || status === 'failed') {
+        toneService.playDisconnectTone();
+        // Only clean up if this is still the active call (endCall may have already cleared it)
+        if (this.currentCall === call) {
+          this.handleCallEnded();
         }
-      });
-
-      this.isOnline = true;
-      console.log('🟢 Successfully registered for incoming calls - client is ONLINE');
-    } catch (error) {
-      console.error('❌ CRITICAL: Failed to go online for incoming calls:', error);
-      this.isOnline = false;
-      // Retry going online after 2 seconds
-      setTimeout(() => this.registerForIncomingCalls(), 2000);
-    }
-  }
-
-  private setupEventListeners() {
-    if (!this.client || !this.client.__wsClient) return;
-
-    // Don't setup listeners again if already set up
-    if (this.hasSetupListeners) {
-      console.log('✓ Event listeners already set up, skipping');
-      return;
-    }
-
-    const wsClient = this.client.__wsClient;
-    this.hasSetupListeners = true;
-
-    // Log all events for debugging
-    console.log('Setting up WebSocket event listeners...');
-
-    // Listen for incoming calls if the method exists
-    if (wsClient.on) {
-      wsClient.on('call.received', (call: any) => {
-        console.log('🔔 Incoming call received:', call);
-
-        // Play incoming call ringtone
-        toneService.playIncomingCallTone();
-
-        if (this.onIncomingCall) {
-          const remoteNumber = call.from || 'Unknown';
-          this.onIncomingCall(remoteNumber);
-          this.currentCall = call;
-        }
-      });
-
-      // Listen for all WebSocket events for debugging
-      const events = [
-        'message',
-        'error',
-        'close',
-        'open',
-        'session.connected',
-        'session.disconnected',
-        'session.reconnecting',
-        'session.auth_error',
-        'session.expiring',
-        'session.idle',
-        'call.state',
-        'call.created',
-        'call.answered',
-        'call.ended',
-        'call.updated',
-        'verto.bye',  // Remote hangup event
-      ];
-
-      events.forEach(eventName => {
-        if (wsClient.on) {
-          wsClient.on(eventName, (data: any) => {
-            console.log(`📡 WS Event [${eventName}]:`, data);
-
-            // Special handling for verto.bye - remote party hung up
-            if (eventName === 'verto.bye') {
-              console.log('🔴 Remote party hung up (verto.bye)');
-
-              // Extract the call ID from the verto.bye event
-              const byeCallId = data?.callID || data?.dialogParams?.callID;
-              console.log('verto.bye callID:', byeCallId, 'our callID:', this.currentCallId);
-
-              // IMPORTANT: Only handle if this is for OUR current call
-              if (this.currentCallId && byeCallId && byeCallId !== this.currentCallId) {
-                console.log('📞 Ignoring verto.bye - event is for different call');
-                return;
-              }
-
-              // Only play disconnect tone if we're in an active call (not ringing)
-              // Check if there's an actual call in progress
-              if (this.currentCall && this.currentCall.state === 'active') {
-                toneService.playDisconnectTone();
-              }
-
-              this.handleCallEnded();
-            }
-
-            // Special handling for call.state - check if call is ending/ended
-            if (eventName === 'call.state' && data) {
-              // Check nested params structure (from your logs)
-              const callState = data.params?.call_state || data.call_state;
-              const direction = data.params?.direction || data.direction;
-              const callId = data.params?.call_id || data.call_id;
-
-              console.log(`📞 Call state change: ${callState}, direction: ${direction}, callId: ${callId}`);
-
-              // For now, only handle call.state events if we actually have an active call or invite
-              // This prevents handling stray events from other calls
-              if (!this.currentCall && !this.currentInvite) {
-                console.log('📞 Ignoring call.state - no active call or invite');
-                return;
-              }
-
-              // IMPORTANT: Check if this event is for OUR current call
-              // If we have a currentCallId and the event's callId doesn't match, ignore it
-              // This prevents rejected incoming calls from resetting our active call UI
-              if (this.currentCallId && callId && callId !== this.currentCallId) {
-                console.log(`📞 Ignoring call.state - event is for different call (event: ${callId}, ours: ${this.currentCallId})`);
-                return;
-              }
-
-              // Handle canceled inbound calls (caller hung up before answer)
-              if ((callState === 'ending' || callState === 'ended')) {
-                console.log('🔴 Call ending/ended - resetting UI');
-
-                // Check if this is an unanswered inbound call
-                const answerTime = data.params?.answer_time || data.answer_time;
-                const endReason = data.params?.end_reason || data.end_reason;
-                const endSource = data.params?.end_source || data.end_source;
-
-                if (answerTime === 0 || !answerTime) {
-                  console.log('📵 Unanswered call - caller hung up');
-                  // Stop ringtone if it's playing (for unanswered incoming calls)
-                  toneService.stopIncomingCallTone();
-                  // Don't play disconnect tone for unanswered calls
-                } else {
-                  // This was an answered call that ended
-                  // Only play disconnect tone if remote party hung up (not local hangup)
-                  // end_reason 'cancel' usually means remote hangup, 'hangup' means local
-                  if (endReason === 'cancel' || endSource !== 'local') {
-                    console.log('📵 Remote party ended the call - playing disconnect tone');
-                    toneService.playDisconnectTone();
-                  }
-                }
-
-                // Reset the UI
-                this.handleCallEnded();
-
-                // Clear any pending invites
-                if (this.currentInvite) {
-                  this.currentInvite = null;
-                }
-              }
-            }
-          });
-        }
-      });
-
-      // Listen for session events to detect disconnection
-      if (wsClient.session) {
-        wsClient.session.on('session.disconnected', () => {
-          console.log('⚠️ Session disconnected - will reconnect');
-          // Only reconnect if we don't have a client anymore
-          if (!this.client) {
-            this.reconnect();
-          }
-        });
-
-        // Log all session events
-        const sessionEvents = [
-          'session.connected',
-          'session.auth_error',
-          'session.disconnecting',
-          'session.disconnected',
-          'session.expiring',
-          'session.idle',
-          'session.reconnecting',
-          'session.unknown',
-        ];
-
-        sessionEvents.forEach(eventName => {
-          wsClient.session.on(eventName, (data: any) => {
-            console.log(`🔐 Session Event [${eventName}]:`, data || '');
-          });
-        });
       }
-    }
+    });
 
-    // If there's a raw WebSocket, log its events too
-    if (wsClient._ws) {
-      console.log('Raw WebSocket found, attaching listeners...');
+    // Subscribe to remote stream for audio playback
+    this.remoteStreamSub = call.remoteStream$.subscribe((stream) => {
+      if (stream) {
+        const tracks = stream.getAudioTracks();
+        console.log('Remote stream received:', {
+          id: stream.id,
+          active: stream.active,
+          audioTracks: tracks.length,
+          trackDetails: tracks.map(t => ({
+            enabled: t.enabled,
+            readyState: t.readyState,
+            muted: t.muted,
+          })),
+        });
 
-      wsClient._ws.addEventListener('message', (event: any) => {
-        console.log('📥 WS Raw Message:', event.data);
-      });
+        let audioEl = document.getElementById('sw-remote-audio') as HTMLAudioElement;
+        if (!audioEl) {
+          audioEl = document.createElement('audio');
+          audioEl.id = 'sw-remote-audio';
+          audioEl.autoplay = true;
+          document.body.appendChild(audioEl);
+        }
+        audioEl.srcObject = stream;
+        audioEl.volume = 1.0;
 
-      wsClient._ws.addEventListener('error', (event: any) => {
-        console.log('❌ WS Raw Error:', event);
-      });
-
-      wsClient._ws.addEventListener('close', (event: any) => {
-        console.log('🔴 WS Raw Close:', event.code, event.reason);
-      });
-
-      wsClient._ws.addEventListener('open', () => {
-        console.log('🟢 WS Raw Open');
-      });
-    }
-  }
-
-  private scheduleTokenRefresh() {
-    if (this.tokenRefreshTimer) {
-      clearTimeout(this.tokenRefreshTimer);
-    }
-
-    if (!this.currentToken) return;
-
-    // Refresh at 80% of token lifetime
-    const refreshIn = this.currentToken.expires_in * 0.8 * 1000;
-
-    this.tokenRefreshTimer = setTimeout(async () => {
-      await this.refreshToken();
-    }, refreshIn);
-  }
-
-  private async refreshToken() {
-    try {
-      console.log('Refreshing SignalWire token...');
-
-      const newToken = await authAPI.refreshToken(this.currentToken?.token);
-      this.currentToken = newToken;
-
-      // Use updateToken method to refresh without disconnecting
-      if (this.client && this.client.updateToken) {
-        await this.client.updateToken(newToken.token);
-        console.log('✅ Token updated without disconnecting');
+        // Explicitly call play() — autoplay attribute alone can be blocked
+        audioEl.play().catch(err => {
+          console.error('Remote audio play() failed:', err);
+        });
       } else {
-        // Fallback to reconnect if updateToken is not available
-        console.log('updateToken not available, reconnecting...');
-        await this.reconnect();
+        console.log('Remote stream cleared (null)');
       }
-
-      console.log('Token refreshed successfully');
-
-      // Schedule next refresh
-      this.scheduleTokenRefresh();
-    } catch (error) {
-      console.error('Failed to refresh token:', error);
-      // Retry after 5 seconds
-      setTimeout(() => this.refreshToken(), 5000);
-    }
+    });
   }
 
-  private async reconnect() {
-    try {
-      console.log('Attempting to reconnect...');
-
-      // Reset flags
-      this.isOnline = false;
-      this.hasSetupListeners = false;
-
-      // Clear any existing call and invite
-      this.currentCall = null;
-      this.currentCallId = null;
-      this.currentInvite = null;
-
-      // Disconnect existing client safely
-      if (this.client && typeof this.client.disconnect === 'function') {
-        try {
-          await this.client.disconnect();
-        } catch (disconnectError) {
-          console.debug('Error during reconnect disconnect:', disconnectError);
-          // Continue with reconnection anyway
-        }
-        this.client = null;
-      }
-
-      // Reinitialize with new token and debugging
-      if (this.currentToken) {
-        this.client = await SignalWire({
-          token: this.currentToken.token,
-          host: this.currentToken.space_name,
-          logLevel: 'debug',  // Enable debug logging
-          debug: {
-            logWsTraffic: true,  // Log all WebSocket traffic
-          },
-        });
-
-        // IMMEDIATELY go online to receive incoming calls
-        await this.registerForIncomingCalls();
-
-        if (this.client.__wsClient) {
-          this.setupEventListeners();
-        }
-
-        console.log('✅ Reconnected successfully - client is ONLINE');
-      }
-    } catch (error) {
-      console.error('Reconnection failed:', error);
-      // Retry after 5 seconds
-      setTimeout(() => this.reconnect(), 5000);
-    }
+  private cleanupCallSubscriptions() {
+    this.callStatusSub?.unsubscribe();
+    this.callStatusSub = null;
+    this.remoteStreamSub?.unsubscribe();
+    this.remoteStreamSub = null;
   }
 
   async makeCall(phoneNumber: string): Promise<any> {
-    console.log('🔵 makeCall() called with:', phoneNumber);
-
     if (!this.client) {
-      console.log('❌ Client not initialized, attempting to reinitialize...');
-      // Try to reinitialize if we have a token
-      if (this.currentToken) {
-        await this.reconnect();
-      }
-      // Check again after reconnect attempt
-      if (!this.client) {
-        throw new Error('SignalWire client not initialized');
-      }
+      throw new Error('SignalWire client not initialized');
     }
 
-    console.log('✅ Client exists, preparing to dial...');
-    console.log('Client object:', this.client);
-    console.log('Client methods available:', Object.keys(this.client));
-
     try {
-      // Create a dedicated container for SignalWire media elements
-      // Don't use React's root element to avoid DOM conflicts
-      let rootElement = document.getElementById('signalwire-media');
-      if (!rootElement) {
-        rootElement = document.createElement('div');
-        rootElement.id = 'signalwire-media';
-        rootElement.style.display = 'none';  // Hide since we're only doing audio
-        document.body.appendChild(rootElement);
-      } else {
-        // Clear any existing content to avoid conflicts
-        while (rootElement.firstChild) {
-          rootElement.removeChild(rootElement.firstChild);
-        }
-      }
-      console.log('📍 Root element for media:', rootElement);
-
-      // Format the phone number (ensure it starts with +)
+      // Format phone number
       let formattedNumber = phoneNumber;
       if (!formattedNumber.startsWith('+')) {
-        // Assume US number if no country code
         if (formattedNumber.length === 10) {
           formattedNumber = '+1' + formattedNumber;
         } else if (formattedNumber.length === 11 && formattedNumber.startsWith('1')) {
@@ -505,122 +213,18 @@ class SignalWireService {
           formattedNumber = '+' + formattedNumber;
         }
       }
-      console.log('📞 Formatted number:', formattedNumber);
+      console.log('Dialing:', formattedNumber);
 
-      // Try different formats for PSTN dialing
-      // Option 1: Direct phone number
-      // Option 2: With /public/ prefix (resource address)
-      const dialParams = {
-        to: formattedNumber,  // Try direct first, may need /public/ prefix
-        rootElement: rootElement,
-	      callerIdName: "Brian West",
-	      callerIdNumber: "+12068655443",
+      const call = await this.client.dial(formattedNumber, {
         audio: true,
         video: false,
-      };
+      });
 
-      console.log('⚠️ Note: If dial fails, may need to use resource address like /public/{number}');
-      console.log('📤 Dial parameters:', dialParams);
-
-      // Make the call using Fabric dial method
-      console.log('🎯 Calling client.dial()...');
-      let call;
-      try {
-        call = await this.client.dial(dialParams);
-        console.log('🎉 client.dial() returned:', call);
-        console.log('Call object type:', typeof call);
-        console.log('Call object keys:', call ? Object.keys(call) : 'null');
-      } catch (dialError: any) {
-        console.error('❌ client.dial() threw an error:', dialError);
-        console.error('Error type:', dialError?.constructor?.name);
-        console.error('Error message:', dialError?.message);
-        console.error('Error stack:', dialError?.stack);
-
-        // Check if it's a format issue
-        if (dialError?.message?.includes('address') || dialError?.message?.includes('format')) {
-          console.error('🔄 Possible format issue. Phone numbers might need to be in resource address format.');
-          console.error('Try formats like: /public/+19184249378 or /pstn/+19184249378');
-        }
-
-        throw dialError;
-      }
-
-      // Store the call object and its ID
       this.currentCall = call;
-      this.currentCallId = call?.id || call?.uuid || null;
-      this.wasIncomingCall = false;  // Mark this as an outgoing call
-      console.log('📝 Stored outgoing call with ID:', this.currentCallId);
+      this.wasIncomingCall = false;
+      this.setupCallSubscriptions(call);
 
-      // Set up event listeners
-      if (call) {
-        console.log('📡 Setting up call event listeners...');
-
-        // Listen for ALL events on the call object
-        const events = [
-          'call.state', 'call.ended', 'destroy', 'error', 'answered', 'hangup',
-          'state.update', 'member.joined', 'member.left', 'room.started', 'room.ended',
-          'member.updated', 'layout.changed', 'call.received', 'call.answered'
-        ];
-        events.forEach(eventName => {
-          if (call.on) {
-            call.on(eventName, (data: any) => {
-              console.log(`🔔 Call Event [${eventName}]:`, data);
-            });
-          }
-        });
-
-        // Check the current state of the call
-        console.log('🔍 Checking call state after dial:');
-        console.log('Call state:', call.state);
-        console.log('Call active?:', call.active);
-        console.log('Call id:', call.id || call.uuid);
-
-        // Check if we need to explicitly start or join the call
-        if (call.join && typeof call.join === 'function') {
-          console.log('🎯 Attempting to join the call...');
-          try {
-            await call.join();
-            console.log('✅ Joined the call');
-          } catch (joinError) {
-            console.error('❌ Failed to join call:', joinError);
-          }
-        }
-
-        call.on('call.state', (state: any) => {
-          console.log('📱 Call state change:', state);
-
-          // Extract call ID from event if available
-          const eventCallId = state?.call_id || state?.callID;
-
-          // IMPORTANT: Only process if this event is for OUR call
-          if (this.currentCallId && eventCallId && eventCallId !== this.currentCallId) {
-            console.log(`📞 Ignoring call.state on outbound call object - event is for different call (event: ${eventCallId}, ours: ${this.currentCallId})`);
-            return;
-          }
-        });
-
-        call.on('call.ended', () => {
-          console.log('📴 Call ended by remote party or network');
-          this.handleCallEnded();
-        });
-
-        call.on('destroy', () => {
-          console.log('💥 Call destroyed');
-          this.handleCallEnded();
-        });
-
-        // Listen for hangup event
-        call.on('hangup', (reason: any) => {
-          console.log('📵 Call hung up:', reason);
-          this.handleCallEnded();
-        });
-        await call.start();
-      } else {
-        console.error('⚠️ Call object is null/undefined!');
-      }
-
-      console.log('✅ Call initiated successfully');
-      console.log('📦 Full call object:', call);
+      console.log('Call initiated successfully');
       return call;
     } catch (error) {
       console.error('Failed to make call:', error);
@@ -629,167 +233,67 @@ class SignalWireService {
   }
 
   async endCall() {
+    const call = this.currentCall;
+    if (!call) return;
+
+    // Eagerly clean up state so incoming calls aren't blocked by stale references.
+    // Don't wait for the SDK's status$ to emit 'disconnected' — it may be delayed
+    // or never fire if the call was still in ICE negotiation.
+    toneService.playDisconnectTone();
+    this.handleCallEnded();
+
+    // Best-effort hangup signal to the server
     try {
-      if (this.currentCall && this.currentCall.hangup) {
-        await this.currentCall.hangup();
-        // Don't null the currentCall here, let the event handler do it
-      }
-      console.log('Call ending...');
+      await call.hangup();
     } catch (error) {
-      console.error('Failed to end call:', error);
-      // Clear the call reference even if hangup fails
-      this.currentCall = null;
-      this.currentCallId = null;
+      console.debug('Hangup during endCall (ignored):', error);
     }
   }
 
   async answerCall() {
-    if (!this.currentInvite) {
-      console.error('❌ No incoming invite to answer');
+    if (!this.pendingCall) {
       throw new Error('No incoming call to answer');
     }
 
-    // Prevent double-answering
     if (this.currentCall) {
-      console.warn('⚠️ Call already in progress, ignoring answer');
+      console.warn('Call already in progress, ignoring answer');
       return;
     }
 
     try {
-      console.log('📢 Answering incoming call...');
-      console.log('Invite object:', this.currentInvite);
-
-      // Stop the ringtone since we're answering
+      console.log('Answering incoming call...');
       toneService.stopIncomingCallTone();
 
-      // Store invite temporarily and clear it to prevent double-answer
-      const invite = this.currentInvite;
-      this.currentInvite = null;
-      this.wasIncomingCall = true;  // Mark this as an incoming call
+      const call = this.pendingCall;
+      this.pendingCall = null;
+      this.currentCall = call;
+      this.wasIncomingCall = true;
 
-      // Use dedicated container for media elements
-      let rootElement = document.getElementById('signalwire-media');
-      if (!rootElement) {
-        rootElement = document.createElement('div');
-        rootElement.id = 'signalwire-media';
-        rootElement.style.display = 'none';
-        document.body.appendChild(rootElement);
-      } else {
-        // Clear any existing content to avoid conflicts
-        while (rootElement.firstChild) {
-          rootElement.removeChild(rootElement.firstChild);
-        }
-      }
+      call.answer();
+      this.setupCallSubscriptions(call);
 
-      // Accept the invite - this returns the actual call object
-      console.log('🎯 Calling invite.accept()...');
-      const acceptedCall = invite.accept({
-        rootElement: rootElement,
-        audio: true,
-        video: false,
-      });
-
-      console.log('✅ Invite accepted, call object:', acceptedCall);
-      console.log('Call type:', acceptedCall?.constructor?.name);
-      console.log('Call id:', acceptedCall?.id || acceptedCall?.uuid);
-
-      // Now store the actual call object and its ID
-      this.currentCall = acceptedCall;
-      this.currentCallId = acceptedCall?.id || acceptedCall?.uuid || null;
-      console.log('📝 Stored incoming call with ID:', this.currentCallId);
-
-      // Store in window for debugging (like in the example)
-      // @ts-ignore
-      window._calleeCall = acceptedCall;
-
-      // Start the call - THIS IS CRITICAL!
-      console.log('🚀 Starting the accepted call...');
-      await acceptedCall.start();
-      console.log('✅ Call started successfully');
-
-      // @ts-ignore
-      window._calleeCallAnswered = true;
-
-      // Set up event listeners for the accepted call (matching official example)
-      if (acceptedCall) {
-        // Listen for call state changes (primary event per official example)
-        acceptedCall.on('call.state', (params: any) => {
-          console.log('📱 Call state changed:', params.call_state || params);
-
-          // Extract call ID from event
-          const eventCallId = params.call_id || params.callID;
-
-          // IMPORTANT: Only process if this event is for OUR call
-          if (this.currentCallId && eventCallId && eventCallId !== this.currentCallId) {
-            console.log(`📞 Ignoring call.state on call object - event is for different call (event: ${eventCallId}, ours: ${this.currentCallId})`);
-            return;
-          }
-
-          // Handle call ended state
-          if (params.call_state === 'ended') {
-            console.log('📴 Call ended - call.state = ended');
-            this.handleCallEnded();
-          }
-        });
-
-        // Listen for member events (from official example)
-        acceptedCall.on('member.joined', (params: any) => {
-          console.log('👤 Member joined:', params);
-        });
-
-        acceptedCall.on('member.left', (params: any) => {
-          console.log('👤 Member left:', params);
-        });
-
-        // Listen for stream events (from official example)
-        acceptedCall.on('stream.started', (params: any) => {
-          console.log('📡 Stream started:', params);
-        });
-
-        acceptedCall.on('stream.ended', (params: any) => {
-          console.log('📡 Stream ended:', params);
-        });
-
-        // Keep our additional events for redundancy
-        acceptedCall.on('destroy', () => {
-          console.log('💥 Call destroyed');
-          // @ts-ignore
-          window._calleeCallDestroyed = true;
-          this.handleCallEnded();
-        });
-
-        acceptedCall.on('error', (error: any) => {
-          console.error('❌ Call error:', error);
-        });
-      }
-
-      console.log('✅ Call answered successfully');
+      console.log('Call answered successfully');
     } catch (error) {
-      console.error('❌ Failed to answer call:', error);
-      this.currentInvite = null;  // Clear invite on error
+      console.error('Failed to answer call:', error);
+      this.pendingCall = null;
       throw error;
     }
   }
 
   async rejectCall() {
-    if (!this.currentInvite) {
+    if (!this.pendingCall) {
       throw new Error('No incoming call to reject');
     }
 
     try {
-      console.log('🚫 Rejecting incoming call...');
-
-      // Stop the ringtone since we're rejecting
+      console.log('Rejecting incoming call...');
       toneService.stopIncomingCallTone();
-
-      // Reject the invite
-      await this.currentInvite.reject();
-
-      this.currentInvite = null;  // Clear the invite
-      console.log('✅ Call rejected');
+      this.pendingCall.reject();
+      this.pendingCall = null;
+      console.log('Call rejected');
     } catch (error) {
-      console.error('❌ Failed to reject call:', error);
-      this.currentInvite = null;  // Clear invite on error
+      console.error('Failed to reject call:', error);
+      this.pendingCall = null;
       throw error;
     }
   }
@@ -800,71 +304,24 @@ class SignalWireService {
       return;
     }
 
-    // Don't even try to use the SDK methods - go straight to WebRTC
     try {
-      // Method 1: Try to access the RTCPeer and its local audio track
-      const rtcPeerMap = this.currentCall.rtcPeerMap;
-      if (rtcPeerMap && rtcPeerMap.size > 0) {
-        // Get the first RTCPeer (there's usually only one in a 1-to-1 call)
-        const rtcPeer = rtcPeerMap.values().next().value;
-        if (rtcPeer?.localAudioTrack) {
-          rtcPeer.localAudioTrack.enabled = !muted;
-          console.log(`Audio ${muted ? 'muted' : 'unmuted'} via RTCPeer localAudioTrack`);
-          return;
-        }
+      const self = this.currentCall.self;
+      if (!self) {
+        console.warn('Self participant not available yet');
+        return;
       }
-
-      // Method 2: Try to access the local stream directly
-      if (this.currentCall._localStream) {
-        const audioTracks = this.currentCall._localStream.getAudioTracks();
-        if (audioTracks.length > 0) {
-          audioTracks.forEach((track: MediaStreamTrack) => {
-            track.enabled = !muted;
-          });
-          console.log(`Audio ${muted ? 'muted' : 'unmuted'} via _localStream`);
-          return;
-        }
+      if (muted) {
+        await self.mute();
+      } else {
+        await self.unmute();
       }
-
-      // Method 3: Try to get the peer connection and its senders
-      if (rtcPeerMap && rtcPeerMap.size > 0) {
-        const rtcPeer = rtcPeerMap.values().next().value;
-        if (rtcPeer?.instance) {
-          const senders = rtcPeer.instance.getSenders();
-          const audioSender = senders.find((sender: RTCRtpSender) => sender.track?.kind === 'audio');
-          if (audioSender?.track) {
-            audioSender.track.enabled = !muted;
-            console.log(`Audio ${muted ? 'muted' : 'unmuted'} via RTCPeerConnection sender`);
-            return;
-          }
-        }
-      }
-
-      // Method 4: Last resort - try to find any MediaStream in the call object
-      for (const key of Object.keys(this.currentCall)) {
-        const value = this.currentCall[key];
-        if (value instanceof MediaStream) {
-          const audioTracks = value.getAudioTracks();
-          if (audioTracks.length > 0) {
-            audioTracks.forEach(track => {
-              track.enabled = !muted;
-            });
-            console.log(`Audio ${muted ? 'muted' : 'unmuted'} via MediaStream found at key: ${key}`);
-            return;
-          }
-        }
-      }
-
-      console.warn('Could not find audio track to mute/unmute');
+      console.log(`Audio ${muted ? 'muted' : 'unmuted'}`);
     } catch (error) {
       console.error('Error toggling mute:', error);
-      // Don't throw - just log the error since mute is not critical
     }
   }
 
   async toggleSpeaker(speakerOn: boolean) {
-    // This would need platform-specific implementation
-    // For web, we can't directly control speaker output
     console.log('Speaker toggle:', speakerOn);
   }
 
@@ -875,80 +332,58 @@ class SignalWireService {
   }
 
   private handleCallEnded() {
-    console.log('🔔 handleCallEnded - cleaning up and notifying UI');
-
-    // Use the tracked call direction
+    console.log('handleCallEnded - cleaning up');
     const wasIncoming = this.wasIncomingCall;
 
-    // Clear the current call and reset tracking
+    this.cleanupCallSubscriptions();
     this.currentCall = null;
-    this.currentCallId = null;  // Clear the tracked call ID
-    this.currentInvite = null;
+    this.pendingCall = null;
     this.wasIncomingCall = false;
 
-    // Notify the UI to return to idle state
+    // Clean up audio element
+    const audioEl = document.getElementById('sw-remote-audio') as HTMLAudioElement;
+    if (audioEl) {
+      audioEl.srcObject = null;
+    }
+
     if (this.onCallEnded) {
-      console.log('🔔 Notifying UI of call end, wasIncoming:', wasIncoming);
+      console.log('Notifying UI of call end, wasIncoming:', wasIncoming);
       this.onCallEnded(wasIncoming);
     }
   }
 
   disconnect() {
-    // Guard against disconnect being called when client never initialized
     if (!this.client) {
-      console.log('⚠️ Disconnect called but no client exists - ignoring');
+      console.log('Disconnect called but no client exists - ignoring');
       return;
     }
 
-    console.log('🛑 SignalWire service disconnecting...');
-    console.log('Current call exists?', !!this.currentCall);
+    console.log('SignalWire service disconnecting...');
 
-    // Clean up the media container to avoid React DOM conflicts
-    const mediaContainer = document.getElementById('signalwire-media');
-    if (mediaContainer && mediaContainer.parentNode) {
-      // Clear any child nodes first
-      while (mediaContainer.firstChild) {
-        mediaContainer.removeChild(mediaContainer.firstChild);
-      }
-      mediaContainer.parentNode.removeChild(mediaContainer);
-      console.log('🗑️ Removed media container');
-    }
+    this.cleanupCallSubscriptions();
+    this.incomingCallSub?.unsubscribe();
+    this.incomingCallSub = null;
+    this.errorSub?.unsubscribe();
+    this.errorSub = null;
 
-    if (this.tokenRefreshTimer) {
-      clearTimeout(this.tokenRefreshTimer);
-      this.tokenRefreshTimer = null;
-    }
-
-    // Safely try to hangup current call if it exists
-    if (this.currentCall && typeof this.currentCall.hangup === 'function') {
+    if (this.currentCall) {
       this.currentCall.hangup().catch((error: any) => {
-        // Ignore hangup errors during disconnect
         console.debug('Hangup error during disconnect (ignored):', error.message);
       });
       this.currentCall = null;
-      this.currentCallId = null;
     }
 
-    // Clear any pending invite
-    this.currentInvite = null;
+    this.pendingCall = null;
 
-    // Go offline before disconnecting
-    if (this.client && typeof this.client.offline === 'function') {
-      this.client.offline().catch((error: any) => {
-        console.debug('Offline error (ignored):', error.message);
-      });
-      this.isOnline = false;
-    }
+    this.client.unregister().catch((error: any) => {
+      console.debug('Unregister error (ignored):', error.message);
+    });
 
-    // Safely disconnect the client - this should only happen on unmount
-    if (this.client && typeof this.client.disconnect === 'function') {
-      this.client.disconnect().catch((error: any) => {
-        // Ignore disconnect errors
-        console.debug('Client disconnect error (ignored):', error.message);
-      });
-      this.client = null;
-      this.hasSetupListeners = false;
-    }
+    this.client.disconnect().catch((error: any) => {
+      console.debug('Disconnect error (ignored):', error.message);
+    });
+
+    this.client = null;
   }
 }
 

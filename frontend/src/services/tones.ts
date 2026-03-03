@@ -1,6 +1,6 @@
 class ToneService {
   private audioContext: AudioContext | null = null;
-  private incomingCallInterval: NodeJS.Timeout | null = null;
+  private incomingCallInterval: ReturnType<typeof setInterval> | null = null;
   private currentRingtoneOscillators: OscillatorNode[] = [];
 
   private getAudioContext(): AudioContext {
