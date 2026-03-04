@@ -2,6 +2,7 @@ import React, { useState, useEffect } from 'react';
 import { PhoneOff, Mic, MicOff, Volume2, VolumeX, Keyboard } from 'lucide-react';
 import DialPad from './DialPad';
 import { useSignalWire } from '../hooks/useSignalWire';
+import { useCallStore } from '../hooks/useCallStore';
 
 interface CallScreenProps {
   phoneNumber: string;
@@ -24,6 +25,7 @@ const CallScreen: React.FC<CallScreenProps> = ({
   const [showDialPad, setShowDialPad] = useState(false);
   const [dialPadInput, setDialPadInput] = useState('');
   const { sendDTMF } = useSignalWire();
+  const callStatus = useCallStore((s) => s.callStatus);
 
   useEffect(() => {
     const interval = setInterval(() => {
@@ -105,7 +107,9 @@ const CallScreen: React.FC<CallScreenProps> = ({
             {/* Call Info */}
             <div className="flex-1 flex flex-col justify-center items-center px-4 py-4 min-h-0">
               <div className="text-center">
-                <div className="text-sm text-gray-400 mb-2">calling...</div>
+                <div className="text-sm text-gray-400 mb-2">
+                  {callStatus === 'connected' ? 'connected' : 'calling...'}
+                </div>
                 <div className="text-2xl sm:text-3xl font-light mb-4">{phoneNumber}</div>
                 <div className="text-lg sm:text-xl text-gray-300">{formatDuration(callDuration)}</div>
               </div>

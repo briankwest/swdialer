@@ -19,14 +19,17 @@ class SignalWireService {
   private callStatusSub: Subscription | null = null;
   private remoteStreamSub: Subscription | null = null;
   private errorSub: Subscription | null = null;
+  private remoteAudioCheckInterval: ReturnType<typeof setInterval> | null = null;
 
   // Callbacks
   private onIncomingCall: ((remoteNumber: string) => void) | null = null;
   private onCallEnded: ((wasIncoming: boolean) => void) | null = null;
+  private onCallConnected: (() => void) | null = null;
 
   async initialize(
     onIncomingCall?: (remoteNumber: string) => void,
-    onCallEnded?: (wasIncoming: boolean) => void
+    onCallEnded?: (wasIncoming: boolean) => void,
+    onCallConnected?: () => void
   ) {
     if (this.isInitializing || this.isInitialized) {
       console.log('SignalWire initialization already in progress or completed, skipping...');
@@ -42,6 +45,7 @@ class SignalWireService {
     try {
       this.onIncomingCall = onIncomingCall || null;
       this.onCallEnded = onCallEnded || null;
+      this.onCallConnected = onCallConnected || null;
 
       // Create credential provider with automatic refresh
       const credentialProvider = {
@@ -145,7 +149,11 @@ class SignalWireService {
     // Subscribe to call status changes
     this.callStatusSub = call.status$.subscribe((status) => {
       console.log('Call status:', status);
-      if (status === 'disconnected' || status === 'failed') {
+      if (status === 'connected') {
+        if (this.onCallConnected) {
+          this.onCallConnected();
+        }
+      } else if (status === 'disconnected' || status === 'failed') {
         toneService.playDisconnectTone();
         // Only clean up if this is still the active call (endCall may have already cleared it)
         if (this.currentCall === call) {
@@ -157,34 +165,8 @@ class SignalWireService {
     // Subscribe to remote stream for audio playback
     this.remoteStreamSub = call.remoteStream$.subscribe((stream) => {
       if (stream) {
-        const tracks = stream.getAudioTracks();
-        console.log('Remote stream received:', {
-          id: stream.id,
-          active: stream.active,
-          audioTracks: tracks.length,
-          trackDetails: tracks.map(t => ({
-            enabled: t.enabled,
-            readyState: t.readyState,
-            muted: t.muted,
-          })),
-        });
-
-        let audioEl = document.getElementById('sw-remote-audio') as HTMLAudioElement;
-        if (!audioEl) {
-          audioEl = document.createElement('audio');
-          audioEl.id = 'sw-remote-audio';
-          audioEl.autoplay = true;
-          document.body.appendChild(audioEl);
-        }
-        audioEl.srcObject = stream;
-        audioEl.volume = 1.0;
-
-        // Explicitly call play() — autoplay attribute alone can be blocked
-        audioEl.play().catch(err => {
-          console.error('Remote audio play() failed:', err);
-        });
-      } else {
-        console.log('Remote stream cleared (null)');
+        console.log('remoteStream$ emitted stream:', stream.id);
+        this.playRemoteStream(stream);
       }
     });
   }
@@ -194,6 +176,109 @@ class SignalWireService {
     this.callStatusSub = null;
     this.remoteStreamSub?.unsubscribe();
     this.remoteStreamSub = null;
+    if (this.remoteAudioCheckInterval) {
+      clearInterval(this.remoteAudioCheckInterval);
+      this.remoteAudioCheckInterval = null;
+    }
+  }
+
+  // Fallback: directly access RTCPeerConnection receivers when remoteStream$ doesn't emit
+  private setupRemoteAudioFallback(call: Call) {
+    const pc = (call as any).rtcPeerConnection as RTCPeerConnection | undefined;
+    if (pc) {
+      console.log('PC available immediately, state:', pc.connectionState, 'ice:', pc.iceConnectionState);
+      this.monitorPeerConnection(pc);
+      return;
+    }
+
+    // PC may not be ready yet — poll until it is
+    let attempts = 0;
+    this.remoteAudioCheckInterval = setInterval(() => {
+      attempts++;
+      const rtcPC = (call as any).rtcPeerConnection as RTCPeerConnection | undefined;
+      if (rtcPC) {
+        console.log('PC became available after', attempts, 'checks, state:', rtcPC.connectionState);
+        if (this.remoteAudioCheckInterval) {
+          clearInterval(this.remoteAudioCheckInterval);
+          this.remoteAudioCheckInterval = null;
+        }
+        this.monitorPeerConnection(rtcPC);
+      } else if (attempts > 30) {
+        console.warn('Gave up waiting for RTCPeerConnection');
+        if (this.remoteAudioCheckInterval) {
+          clearInterval(this.remoteAudioCheckInterval);
+          this.remoteAudioCheckInterval = null;
+        }
+      }
+    }, 500);
+  }
+
+  private monitorPeerConnection(pc: RTCPeerConnection) {
+    // Listen for track events (addEventListener doesn't overwrite the SDK's ontrack handler)
+    pc.addEventListener('track', (event) => {
+      console.log('PC track event:', event.track.kind, 'streams:', event.streams.length);
+      if (event.track.kind === 'audio') {
+        const stream = event.streams[0] || new MediaStream([event.track]);
+        this.playRemoteStream(stream);
+      }
+    });
+
+    // Check existing receivers — tracks may already be there
+    this.checkReceivers(pc);
+
+    // Also re-check when ICE connects (remote media starts flowing)
+    // and detect call end as fallback when status$ doesn't fire
+    pc.addEventListener('iceconnectionstatechange', () => {
+      console.log('ICE connection state:', pc.iceConnectionState);
+      if (pc.iceConnectionState === 'connected' || pc.iceConnectionState === 'completed') {
+        this.checkReceivers(pc);
+      } else if (pc.iceConnectionState === 'closed' || pc.iceConnectionState === 'failed') {
+        console.log('ICE closed/failed - triggering call cleanup as fallback');
+        if (this.currentCall) {
+          this.handleCallEnded();
+        }
+      }
+    });
+
+    pc.addEventListener('connectionstatechange', () => {
+      console.log('PC connection state:', pc.connectionState);
+      if (pc.connectionState === 'closed' || pc.connectionState === 'failed') {
+        console.log('PC closed/failed - triggering call cleanup as fallback');
+        if (this.currentCall) {
+          this.handleCallEnded();
+        }
+      }
+    });
+  }
+
+  private checkReceivers(pc: RTCPeerConnection) {
+    const receivers = pc.getReceivers();
+    const audioReceiver = receivers.find(r => r.track?.kind === 'audio');
+    if (audioReceiver?.track) {
+      console.log('Audio receiver found, track state:', audioReceiver.track.readyState, 'enabled:', audioReceiver.track.enabled, 'muted:', audioReceiver.track.muted);
+      if (audioReceiver.track.readyState === 'live') {
+        const stream = new MediaStream([audioReceiver.track]);
+        this.playRemoteStream(stream);
+      }
+    } else {
+      console.log('No audio receiver found, receivers:', receivers.length);
+    }
+  }
+
+  private playRemoteStream(stream: MediaStream) {
+    console.log('Playing remote stream:', stream.id, 'tracks:', stream.getAudioTracks().length);
+    let audioEl = document.getElementById('sw-remote-audio') as HTMLAudioElement;
+    if (!audioEl) {
+      audioEl = document.createElement('audio');
+      audioEl.id = 'sw-remote-audio';
+      audioEl.autoplay = true;
+      document.body.appendChild(audioEl);
+    }
+    audioEl.srcObject = stream;
+    audioEl.volume = 1.0;
+    audioEl.play().catch(err => {
+      console.error('Remote audio play() failed:', err);
+    });
   }
 
   async makeCall(phoneNumber: string): Promise<any> {
@@ -223,6 +308,7 @@ class SignalWireService {
       this.currentCall = call;
       this.wasIncomingCall = false;
       this.setupCallSubscriptions(call);
+      this.setupRemoteAudioFallback(call);
 
       console.log('Call initiated successfully');
       return call;
@@ -271,6 +357,7 @@ class SignalWireService {
 
       call.answer();
       this.setupCallSubscriptions(call);
+      this.setupRemoteAudioFallback(call);
 
       console.log('Call answered successfully');
     } catch (error) {

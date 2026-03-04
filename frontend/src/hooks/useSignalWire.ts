@@ -38,6 +38,11 @@ export const useSignalWire = () => {
               // We'll use a callback or event to clear the number
               window.dispatchEvent(new CustomEvent('clearDialedNumber'));
             }
+          },
+          // onCallConnected callback - call answered/connected
+          () => {
+            console.log('🔔 Call connected');
+            setCallState({ callStatus: 'connected' });
           }
         );
 
@@ -76,9 +81,10 @@ export const useSignalWire = () => {
       const call = await signalWireService.makeCall(phoneNumber);
       console.log('✅ SignalWire service returned call object:', call);
 
-      // Update the call status to connected (but don't change isInCall as it's already set)
+      // Call has been placed, waiting for remote to answer
+      // Actual 'connected' status will come via onCallConnected callback
       setCallState({
-        callStatus: 'connected',
+        callStatus: 'ringing',
       });
 
       console.log('✅ Call state updated, call should be active');
