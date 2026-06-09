@@ -481,10 +481,13 @@ class SignalWireService {
 
     this.pendingCall = null;
 
-    this.client.unregister().catch((error) => {
-      console.debug('Unregister error (ignored):', error?.message);
-    });
-
+    // Just close the connection. We deliberately do NOT call unregister() first:
+    // disconnect() (invoked from beforeunload) tears down the WebSocket, and the
+    // server marks the subscriber offline as soon as that socket drops. Calling
+    // unregister() races with this teardown — its `subscriber.offline` RPC never
+    // gets a response before the transport is destroyed, which surfaces as a
+    // noisy RPCTimeoutError on errors$. unregister() is only for going offline
+    // while staying connected, which this app never needs.
     this.client.disconnect().catch((error) => {
       console.debug('Disconnect error (ignored):', error?.message);
     });
