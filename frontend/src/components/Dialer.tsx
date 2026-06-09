@@ -155,6 +155,10 @@ const Dialer: React.FC = () => {
 
     window.addEventListener('keydown', handleKeyboardInput);
     return () => window.removeEventListener('keydown', handleKeyboardInput);
+    // Re-bind only when the values the handlers gate on change. handleCall/
+    // handleKeyInput are recreated every render, so listing them would re-attach
+    // the listener on every render with no behavioral benefit.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [phoneNumber, isInCall, isIncoming]);
 
   const formatPhoneNumber = (number: string): string => {

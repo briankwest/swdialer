@@ -98,7 +98,8 @@ const DialPad: React.FC<DialPadProps> = ({
 
   const playDTMFTone = (key: string) => {
     // Simple tone generation using Web Audio API
-    const audioContext = new (window.AudioContext || (window as any).webkitAudioContext)();
+    const audioContext = new (window.AudioContext ||
+      (window as Window & { webkitAudioContext?: typeof AudioContext }).webkitAudioContext)();
     const oscillator1 = audioContext.createOscillator();
     const oscillator2 = audioContext.createOscillator();
     const gainNode = audioContext.createGain();

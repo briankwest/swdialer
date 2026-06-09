@@ -46,6 +46,9 @@ const CallScreen: React.FC<CallScreenProps> = ({
 
     window.addEventListener('keydown', handleKeyboardInput);
     return () => window.removeEventListener('keydown', handleKeyboardInput);
+    // Bind the DTMF key listener once. handleDialPadKey only uses functional
+    // setState and the stable sendDTMF delegator, so there's no stale state.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   const formatDuration = (seconds: number): string => {

@@ -64,6 +64,10 @@ export const useSignalWire = () => {
       // We'll let the service maintain its connection
       // signalWireService.disconnect() should only be called on app unmount
     };
+    // Intentionally run once on mount: the SignalWire singleton must outlive
+    // React unmounts/re-renders (see CLAUDE.md). setCallState/resetCallState are
+    // stable Zustand actions, so omitting them from deps is safe.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   const makeCall = async (phoneNumber: string) => {
@@ -89,14 +93,15 @@ export const useSignalWire = () => {
 
       console.log('✅ Call state updated, call should be active');
       return callData;
-    } catch (err: any) {
+    } catch (err) {
+      const message = err instanceof Error ? err.message : 'Unknown error';
       console.error('❌ Failed to make call:', err);
       console.error('Error details:', {
-        message: err?.message,
-        stack: err?.stack,
+        message,
+        stack: err instanceof Error ? err.stack : undefined,
         fullError: err
       });
-      setError('Failed to make call: ' + (err?.message || 'Unknown error'));
+      setError('Failed to make call: ' + message);
       throw err;
     }
   };

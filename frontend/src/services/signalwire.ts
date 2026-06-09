@@ -19,6 +19,7 @@ class SignalWireService {
   private callStatusSub: Subscription | null = null;
   private remoteStreamSub: Subscription | null = null;
   private errorSub: Subscription | null = null;
+  private warningSub: Subscription | null = null;
   private remoteAudioCheckInterval: ReturnType<typeof setInterval> | null = null;
 
   // Callbacks
@@ -70,9 +71,25 @@ class SignalWireService {
       // Initialize the v4 client
       this.client = new SignalWire(credentialProvider);
 
+      // Default all calls to G.711 (PCMU first, then PCMA). Setting this on the
+      // global client preferences applies to both outbound dials and answered
+      // inbound calls — RTCPeerConnectionController falls back to these when a
+      // call doesn't override preferredAudioCodecs. The SDK reorders the SDP so
+      // these payload types are offered ahead of Opus.
+      this.client.preferences.preferredAudioCodecs = ['PCMU', 'PCMA'];
+
       // Subscribe to errors
       this.errorSub = this.client.errors$.subscribe((error) => {
         console.error('SignalWire error:', error);
+      });
+
+      // Subscribe to non-fatal warnings (new in v4.0.0-rc.0). Because we drive
+      // token refresh ourselves via credentialProvider.refresh(), watch for
+      // 'credential_refresh_fallback' / 'credential_no_refresh_handler' — these
+      // tell us whether our refresh() is actually being used or the session will
+      // silently die at SAT expiry.
+      this.warningSub = this.client.warnings$.subscribe((warning) => {
+        console.warn('SignalWire warning:', warning.code, warning.message);
       });
 
       // Register for incoming calls
@@ -96,10 +113,9 @@ class SignalWireService {
 
         this.pendingCall = ringingCall;
 
-        // fromName/from exist on WebRTCCall at runtime but not on the Call type
-        const callObj = ringingCall as any;
-        const rawName = callObj.fromName;
-        const callerId = (rawName && rawName !== '_undef_') ? rawName : callObj.from || 'Unknown';
+        // fromName/from are public on the v4 Call type (4.0.0-rc.0)
+        const rawName = ringingCall.fromName;
+        const callerId = (rawName && rawName !== '_undef_') ? rawName : ringingCall.from || 'Unknown';
         console.log('Incoming call from:', callerId);
 
         toneService.playIncomingCallTone();
@@ -184,7 +200,8 @@ class SignalWireService {
 
   // Fallback: directly access RTCPeerConnection receivers when remoteStream$ doesn't emit
   private setupRemoteAudioFallback(call: Call) {
-    const pc = (call as any).rtcPeerConnection as RTCPeerConnection | undefined;
+    // rtcPeerConnection is public on the v4 Call type (RTCPeerConnection | undefined)
+    const pc = call.rtcPeerConnection;
     if (pc) {
       console.log('PC available immediately, state:', pc.connectionState, 'ice:', pc.iceConnectionState);
       this.monitorPeerConnection(pc);
@@ -195,7 +212,7 @@ class SignalWireService {
     let attempts = 0;
     this.remoteAudioCheckInterval = setInterval(() => {
       attempts++;
-      const rtcPC = (call as any).rtcPeerConnection as RTCPeerConnection | undefined;
+      const rtcPC = call.rtcPeerConnection;
       if (rtcPC) {
         console.log('PC became available after', attempts, 'checks, state:', rtcPC.connectionState);
         if (this.remoteAudioCheckInterval) {
@@ -281,7 +298,7 @@ class SignalWireService {
     });
   }
 
-  async makeCall(phoneNumber: string): Promise<any> {
+  async makeCall(phoneNumber: string): Promise<Call> {
     if (!this.client) {
       throw new Error('SignalWire client not initialized');
     }
@@ -452,22 +469,24 @@ class SignalWireService {
     this.incomingCallSub = null;
     this.errorSub?.unsubscribe();
     this.errorSub = null;
+    this.warningSub?.unsubscribe();
+    this.warningSub = null;
 
     if (this.currentCall) {
-      this.currentCall.hangup().catch((error: any) => {
-        console.debug('Hangup error during disconnect (ignored):', error.message);
+      this.currentCall.hangup().catch((error) => {
+        console.debug('Hangup error during disconnect (ignored):', error?.message);
       });
       this.currentCall = null;
     }
 
     this.pendingCall = null;
 
-    this.client.unregister().catch((error: any) => {
-      console.debug('Unregister error (ignored):', error.message);
+    this.client.unregister().catch((error) => {
+      console.debug('Unregister error (ignored):', error?.message);
     });
 
-    this.client.disconnect().catch((error: any) => {
-      console.debug('Disconnect error (ignored):', error.message);
+    this.client.disconnect().catch((error) => {
+      console.debug('Disconnect error (ignored):', error?.message);
     });
 
     this.client = null;
