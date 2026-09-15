@@ -2,7 +2,7 @@ import os
 import requests
 from typing import Dict, Optional
 import logging
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 import base64
 
 logger = logging.getLogger(__name__)
@@ -38,13 +38,14 @@ class SignalWireClient:
             # SignalWire Fabric subscriber token endpoint
             url = f"{self.api_base}/subscribers/tokens"
 
-            # Calculate expiry time
-            expires_at = datetime.utcnow() + timedelta(seconds=expires_in)
+            # Calculate expiry time (timezone-aware so .timestamp() is true UTC)
+            expires_at = datetime.now(timezone.utc) + timedelta(seconds=expires_in)
 
             # Prepare the request payload
             payload = {
                 "reference": reference,  # Required field for Fabric tokens
-                "expires_at": expires_at.isoformat() + "Z",
+                # `expire_at` (Unix seconds); the API silently ignores unknown fields
+                "expire_at": int(expires_at.timestamp()),
                 "audio": {
                     "send": True,
                     "receive": True
@@ -71,10 +72,13 @@ class SignalWireClient:
             response.raise_for_status()
             data = response.json()
 
-            # Format the response
+            # Format the response. The API doesn't echo the expiry and the SAT
+            # is encrypted (JWE), so report the expiry we requested. The
+            # browser SDK only schedules credentialProvider.refresh() when
+            # this parses to a valid expiry_at.
             return {
                 "token": data.get("token"),
-                "expires_at": data.get("expires_at"),
+                "expires_at": expires_at.isoformat().replace("+00:00", "Z"),
                 "expires_in": expires_in,
                 "subscriber_id": data.get("subscriber_id"),
                 "project_id": self.project_id,
