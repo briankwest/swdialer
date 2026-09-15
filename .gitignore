@@ -1,0 +1,38 @@
+# Secrets and local config (templates are committed as .env.example)
+.env
+.env.*
+!.env.example
+
+# Python
+venv/
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# Node / frontend
+node_modules/
+dist/
+*.tsbuildinfo
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Built frontend copied in for single-service mode (see README)
+backend/frontend_dist/
+
+# Local checkout of the SignalWire Browser SDK, kept for reference only
+signalwire-js/
+
+# Logs
+*.log
+
+# Editors and OS
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*~
+
+# Claude Code personal settings
+.claude/settings.local.json

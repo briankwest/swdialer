@@ -8,7 +8,7 @@ iPhone-style web dialer using SignalWire's Fabric/WebRTC stack. Two services:
 
 - `backend/` — Flask app on port **5001**. Mints SignalWire subscriber tokens and keeps an in-memory log of calls. It does **not** route media or signaling.
 - `frontend/` — Vite + React + TypeScript on port **5173**. All WebRTC (signaling, media, DTMF) goes through the **published npm package** `@signalwire/js` (pinned to `4.0.0-rc.0` in `frontend/package.json`) directly from the browser. There is **no** local SDK alias — `vite.config.ts` resolves `@signalwire/js` from `node_modules` like any other dependency (and pre-bundles it plus `rxjs` via `optimizeDeps`). npm's `latest`/`rc`/`dev` tags have moved past `rc.0`; check `npm view @signalwire/js dist-tags` rather than assuming. Pin prereleases **exactly** (`npm install --save-exact`) — a caret range on a prerelease will float to other prereleases.
-- `signalwire-js/` — a local checkout of the SignalWire Browser SDK monorepo at the same `4.0.0-rc.0` version. It is **not** wired into the dialer build (we consume the npm package); keep it for reference only — its `examples/` directory is the authoritative guide to the v4 API, and `packages/main/src/` is the SDK source if you need to read it. (It replaced the old `browser-sdk/` alias, which is gone.)
+- `signalwire-js/` — a local, gitignored checkout (its own nested git repo) of the SignalWire Browser SDK monorepo at the same `4.0.0-rc.0` version. It is **not** wired into the dialer build (we consume the npm package); keep it for reference only — its `examples/` directory is the authoritative guide to the v4 API, and `packages/main/src/` is the SDK source if you need to read it. (It replaced the old `browser-sdk/` alias, which is gone.)
 
 ## Commands
 
@@ -29,8 +29,6 @@ npx tsc --noEmit                       # typecheck only
 ```
 
 There are no tests in this repo. `README.md` is the user-facing setup guide (env vars, API table, production steps) — keep it in sync when changing routes, env vars, or setup.
-
-There is **no `.gitignore`**: `.env` files, `node_modules/`, `dist/`, `__pycache__/`, and `signalwire-js/` all show as untracked. Stage files by name; never `git add -A` / `git add .`.
 
 ### Environment
 
